@@ -1,0 +1,27 @@
+for linux platform:
+
+1. Currently, demo and sdk are only used on Ubuntu 20.04.
+
+Support for other types of Linux systems is not guaranteed. If necessary, you can contact research and development personnel for communication and provision.
+
+2. If conducting secondary development, please use the ‘ldd’ command in the development environment to output the package dependency library. If there is a library that cannot be found,
+
+Please copy under lib in the current directory,
+
+If you still cannot find it, please contact the R&D personnel.
+
+3. The robotic arm version that comes with the SDK requires 3.5.17 or higher
+
+for windows platform:
+
+1. win10 64 bit
+
+2. The robotic arm version that comes with the SDK requires 3.5.17 or higher
+
+When using Python,
+We need to modify the IP address in the Common. py file in the sdk_demo_py directory to match the IP address of the teaching pendant, and ensure that it can ping the current machine
+Self. address=b'10.10.33.193 '# IP address
+
+
+
+

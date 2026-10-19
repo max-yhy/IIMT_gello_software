@@ -1,0 +1,29 @@
+# IIMT + GELLO configuration.
+#
+# This file contains the first static calibration. Before running the full
+# teleoperation loop, verify that the IIMT and GELLO readings used to obtain
+# these values came from the same physical pose and verify joint directions.
+
+robot:
+  _target_: gello.robots.iimt.IIMTRobot
+  robot_ip: "192.168.8.87"
+  robot_port: 29999
+  servoj_period: 0.004
+  print_target: true
+  print_target_interval: 0.5
+
+agent:
+  _target_: gello.agents.gello_agent.GelloAgent
+  port: "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBMFB57-if00-port0"
+  dynamixel_config:
+    _target_: gello.agents.gello_agent.DynamixelRobotConfig
+    # ID7 is the Gello gripper and is intentionally not sent to IIMT.
+    joint_ids: [1, 2, 3, 4, 5, 6]
+    joint_offsets: [0.903660, 4.646656, 3.023359, 9.403197, 3.155718, -0.428310]
+    joint_signs: [1, 1, -1, 1, 1, 1]
+    gripper_config: null
+
+# Do not add start_joints until the calibration pose is confirmed. Otherwise
+# launch_yaml.py may issue a startup motion.
+hz: 250
+hardware_server_port: 6001
