@@ -17,6 +17,7 @@ from typing import Dict
 import numpy as np
 
 from gello.robots.robot import Robot
+from gello.robots.joint_smoothing import JointCommandSmoother
 
 
 _NUM_DOFS = 6
@@ -72,6 +73,13 @@ class IIMTRobot(Robot):
         servoj_period: float = 0.008,
         servoj_lookahead_time: float = 0.0,
         servoj_gain: float = 0.0,
+        smooth_mode: str = "raw",
+        interpolation_duration: float = 0.02,
+        second_order_omega: float = 18.0,
+        second_order_zeta: float = 1.0,
+        joint_max_vel: float = 2.5,
+        joint_max_acc: float = 30.0,
+        joint_max_jerk: float = 200.0,
         print_target: bool = False,
         print_target_interval: float = 0.5,
     ):
@@ -109,6 +117,24 @@ class IIMTRobot(Robot):
         self._print_target = bool(print_target)
         self._print_target_interval = float(print_target_interval)
         self._last_target_print_time = 0.0
+        self._smoother = JointCommandSmoother(
+            mode=smooth_mode,
+            dt=self._servoj_period,
+            interpolation_duration=interpolation_duration,
+            second_order_omega=second_order_omega,
+            second_order_zeta=second_order_zeta,
+            joint_max_vel=joint_max_vel,
+            joint_max_acc=joint_max_acc,
+            joint_max_jerk=joint_max_jerk,
+        )
+        self._smoothing_initialized = False
+        self._last_command_joint_state: np.ndarray | None = None
+        if self._smoother.mode == "ruckig" and not self._smoother.ruckig_available:
+            print(
+                "[IIMT] smooth_mode=ruckig, but Python package ruckig is not "
+                "installed; falling back to second-order damping.",
+                flush=True,
+            )
 
     def num_dofs(self) -> int:
         return _NUM_DOFS
@@ -142,6 +168,15 @@ class IIMTRobot(Robot):
         if not np.all(np.isfinite(joint_state)):
             raise ValueError("IIMT joint command contains NaN or infinity")
 
+        # Seed a stateful smoother from the real follower pose. This avoids a
+        # jump on the first command after starting control.
+        if self._smoother.mode != "raw" and not self._smoothing_initialized:
+            self._smoother.reset(self.get_joint_state())
+            self._smoothing_initialized = True
+
+        command_state = self._smoother.update(joint_state, now=time.monotonic())
+        self._last_command_joint_state = command_state.copy()
+
         now = time.monotonic()
         if (
             self._print_target
@@ -164,9 +199,26 @@ class IIMTRobot(Robot):
                 ),
                 flush=True,
             )
+            if self._smoother.mode != "raw":
+                print(
+                    "[IIMT command rad] "
+                    + np.array2string(
+                        command_state, precision=6, suppress_small=False
+                    ),
+                    flush=True,
+                )
+                print(
+                    "[IIMT command deg] "
+                    + np.array2string(
+                        np.rad2deg(command_state),
+                        precision=3,
+                        suppress_small=False,
+                    ),
+                    flush=True,
+                )
 
         servoj = self._api.ServojParam()
-        for index, value in enumerate(joint_state):
+        for index, value in enumerate(command_state):
             servoj.q[index] = float(value)
         servoj.a = self._servoj_acceleration
         servoj.v = self._servoj_velocity
@@ -178,10 +230,33 @@ class IIMTRobot(Robot):
         if not bool(result):
             print(
                 "[IIMT] API_Servoj failed for target: "
-                + np.array2string(joint_state, precision=6),
+                + np.array2string(command_state, precision=6),
                 flush=True,
             )
             raise RuntimeError("IIMT API_Servoj failed")
+
+    @property
+    def last_command_joint_state(self) -> np.ndarray | None:
+        """Return the most recent six-joint command actually sent to Servoj."""
+
+        if self._last_command_joint_state is None:
+            return None
+        return self._last_command_joint_state.copy()
+
+    @property
+    def smooth_mode(self) -> str:
+        return self._smoother.mode
+
+    def reset_smoothing(self, current_joint_state: np.ndarray | None = None) -> None:
+        """Restart the active smoother from the current follower pose."""
+
+        if current_joint_state is None:
+            current_joint_state = self.get_joint_state()
+        self._smoother.reset(current_joint_state)
+        self._smoothing_initialized = True
+        self._last_command_joint_state = np.asarray(
+            current_joint_state, dtype=np.float64
+        ).copy()
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         """Return the observation fields required by ``RobotEnv``."""

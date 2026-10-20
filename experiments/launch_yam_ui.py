@@ -5,14 +5,16 @@ The window opens in read-only mode.  It continuously displays:
 * the current six IIMT joint positions;
 * the raw GELLO/Dynamixel positions;
 * the converted IIMT target positions;
+* the converted Gello target;
+* the command actually sent to API_Servoj after the selected smoother;
 * target minus current error;
 
 in both radians and degrees.
 
-Only the "启动控制" button enables direct API_Servoj calls.  "停止控制"
-clears the send flag but keeps the read-only monitor running.  No
-逐步逼近/interpolation is performed here: every control-cycle target is sent
-directly to the IIMT adapter.
+Only the "启动控制" button enables API_Servoj calls.  "停止控制" clears the
+send flag but keeps the read-only monitor running.  The smoothing mode is
+configured in ``configs/iimt.yaml`` and is applied inside ``IIMTRobot`` so the
+same behavior is used by both this UI and ``launch_yaml.py``.
 """
 
 from __future__ import annotations
@@ -112,6 +114,7 @@ class ControlThread(QThread):
         self._read_gripper = read_gripper
         self._stop_requested = threading.Event()
         self._control_enabled = threading.Event()
+        self._reset_smoothing_requested = threading.Event()
         self._state_lock = threading.Lock()
         self._joint_offsets: np.ndarray | None = None
         self._joint_signs: np.ndarray | None = None
@@ -119,6 +122,9 @@ class ControlThread(QThread):
         self._latest_gello_raw_rad: np.ndarray | None = None
 
     def enable_control(self) -> None:
+        # Re-seed the stateful smoother from the latest follower pose on every
+        # start, so stopping and restarting cannot resume from a stale command.
+        self._reset_smoothing_requested.set()
         self._control_enabled.set()
 
     def disable_control(self) -> None:
@@ -255,6 +261,21 @@ class ControlThread(QThread):
                 print_target_interval=float(
                     robot_cfg.get("print_target_interval", 0.5)
                 ),
+                smooth_mode=str(robot_cfg.get("smooth_mode", "raw")),
+                interpolation_duration=float(
+                    robot_cfg.get("interpolation_duration", 0.02)
+                ),
+                second_order_omega=float(
+                    robot_cfg.get("second_order_omega", 18.0)
+                ),
+                second_order_zeta=float(
+                    robot_cfg.get("second_order_zeta", 1.0)
+                ),
+                joint_max_vel=float(robot_cfg.get("joint_max_vel", 2.5)),
+                joint_max_acc=float(robot_cfg.get("joint_max_acc", 30.0)),
+                joint_max_jerk=float(
+                    robot_cfg.get("joint_max_jerk", 200.0)
+                ),
             )
 
             control_hz = float(self._cfg.get("hz", 30))
@@ -281,8 +302,12 @@ class ControlThread(QThread):
                 # Check immediately before sending. Stop can be clicked while
                 # the read calls above are in progress.
                 if self._control_enabled.is_set():
+                    if self._reset_smoothing_requested.is_set():
+                        robot.reset_smoothing(iimt_current_rad)
+                        self._reset_smoothing_requested.clear()
                     robot.command_joint_state(target_rad)
 
+                command_rad = robot.last_command_joint_state
                 now = time.monotonic()
                 if (
                     last_ui_update == 0.0
@@ -293,6 +318,12 @@ class ControlThread(QThread):
                             "current_rad": iimt_current_rad.copy(),
                             "gello_raw_rad": gello_raw_rad.copy(),
                             "target_rad": target_rad.copy(),
+                            "command_rad": (
+                                None
+                                if command_rad is None
+                                else command_rad.copy()
+                            ),
+                            "smooth_mode": robot.smooth_mode,
                             "control_enabled": self._control_enabled.is_set(),
                         }
                     )
@@ -316,7 +347,14 @@ class ControlThread(QThread):
                 robot.close()
             if reader is not None:
                 reader.clearParam()
-            if port is not None:
+            # DynamixelSDK leaves ``port.ser`` as None when opening the
+            # serial device fails. Its closePort() does not handle that
+            # partial state, so only close a port that actually opened.
+            if (
+                port is not None
+                and getattr(port, "is_open", False)
+                and getattr(port, "ser", None) is not None
+            ):
                 port.closePort()
 
 
@@ -336,7 +374,7 @@ class MainWindow(QMainWindow):
         self._read_gripper = read_gripper
 
         self.setWindowTitle("GELLO → IIMT 关节监控与控制")
-        self.resize(1250, 560)
+        self.resize(1550, 560)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -352,7 +390,7 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: #555;")
         main_layout.addWidget(self.status_label)
 
-        self.table = QTableWidget(7, 9)
+        self.table = QTableWidget(7, 11)
         self.table.setHorizontalHeaderLabels(
             [
                 "关节",
@@ -360,10 +398,12 @@ class MainWindow(QMainWindow):
                 "IIMT 当前 deg",
                 "Gello 原始 rad",
                 "Gello 原始 deg",
-                "目标 rad",
-                "目标 deg",
-                "误差 rad",
-                "误差 deg",
+                "Gello 目标 rad",
+                "Gello 目标 deg",
+                "API发送 rad",
+                "API发送 deg",
+                "目标误差 rad",
+                "目标误差 deg",
             ]
         )
         self.table.verticalHeader().setVisible(False)
@@ -386,7 +426,8 @@ class MainWindow(QMainWindow):
         info_layout = QGridLayout(info_box)
         info_layout.addWidget(
             QLabel(
-                "打开界面只读取数据；点击启动后，按配置 hz 直接调用 API_Servoj。"
+                "打开界面只读取数据；点击启动后，按配置 hz 调用 API_Servoj。"
+                "实际发送值会经过 robot.smooth_mode 指定的平滑模式。"
             ),
             0,
             0,
@@ -399,26 +440,32 @@ class MainWindow(QMainWindow):
             0,
         )
         info_layout.addWidget(QLabel(config_path), 1, 1)
+        smooth_mode = str(cfg.robot.get("smooth_mode", "raw"))
+        smooth_text = (
+            f"平滑模式：{smooth_mode}（可选 raw / linear / second_order / ruckig；"
+            "修改 YAML 后重启界面）"
+        )
+        info_layout.addWidget(QLabel(smooth_text), 2, 0, 1, 2)
 
         self.start_button = QPushButton("启动控制")
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self._start_control)
-        info_layout.addWidget(self.start_button, 2, 0)
+        info_layout.addWidget(self.start_button, 3, 0)
 
         self.stop_button = QPushButton("停止控制")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._stop_control)
-        info_layout.addWidget(self.stop_button, 2, 1)
+        info_layout.addWidget(self.stop_button, 3, 1)
 
         self.calibrate_button = QPushButton("标定当前姿态并保存 offset")
         self.calibrate_button.setEnabled(False)
         self.calibrate_button.clicked.connect(self._calibrate_current_pose)
-        info_layout.addWidget(self.calibrate_button, 3, 0, 1, 2)
+        info_layout.addWidget(self.calibrate_button, 4, 0, 1, 2)
         info_layout.addWidget(
             QLabel(
                 "标定前请让 IIMT 和 Gello 处于同一物理姿态；只更新 offset，不改 joint_signs。"
             ),
-            4,
+            5,
             0,
             1,
             2,
@@ -457,6 +504,9 @@ class MainWindow(QMainWindow):
         current_rad = np.asarray(payload["current_rad"])
         gello_raw_rad = np.asarray(payload["gello_raw_rad"])
         target_rad = np.asarray(payload["target_rad"])
+        command_rad = payload.get("command_rad")
+        if command_rad is not None:
+            command_rad = np.asarray(command_rad)
         error_rad = target_rad - current_rad
 
         for row in range(7):
@@ -468,6 +518,16 @@ class MainWindow(QMainWindow):
                     self._number(np.rad2deg(gello_raw_rad[row]), 3),
                     self._number(target_rad[row], 6),
                     self._number(np.rad2deg(target_rad[row]), 3),
+                    (
+                        "—"
+                        if command_rad is None
+                        else self._number(command_rad[row], 6)
+                    ),
+                    (
+                        "—"
+                        if command_rad is None
+                        else self._number(np.rad2deg(command_rad[row]), 3)
+                    ),
                     self._number(error_rad[row], 6),
                     self._number(np.rad2deg(error_rad[row]), 3),
                 ]
@@ -481,16 +541,19 @@ class MainWindow(QMainWindow):
                     "—",
                     "—",
                     "—",
+                    "—",
+                    "—",
                 ]
             else:
-                values = ["—"] * 8
+                values = ["—"] * 10
 
             for column, value in enumerate(values, start=1):
                 self._set_cell(row, column, value)
 
         if payload["control_enabled"]:
             self.status_label.setText(
-                "控制中：正在直接发送 Gello 目标到 IIMT API_Servoj"
+                f"控制中：模式={payload['smooth_mode']}；"
+                "API_Servoj 使用表中的 API发送值"
             )
             self.status_label.setStyleSheet("color: #b00020; font-weight: bold;")
 
@@ -499,6 +562,7 @@ class MainWindow(QMainWindow):
         self.calibrate_button.setEnabled(True)
         self.status_label.setText(
             "已连接。当前是只读监控；点击“启动控制”才会发送 API_Servoj。"
+            f" 当前模式：{self.thread._cfg.robot.get('smooth_mode', 'raw')}"
         )
         self.status_label.setStyleSheet("color: #176b2c;")
 
@@ -510,7 +574,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.calibrate_button.setEnabled(False)
         self.status_label.setText(
-            "控制中：正在直接发送 Gello 目标到 IIMT API_Servoj"
+            "控制中：正在按平滑模式发送 API_Servoj"
         )
         self.status_label.setStyleSheet("color: #b00020; font-weight: bold;")
 
